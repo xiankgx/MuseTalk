@@ -1,0 +1,56 @@
+# Configuration for Cog ⚙️
+# Reference: https://cog.run/yaml
+
+build:
+  # set to true if your model requires a GPU
+  gpu: True
+
+  # a list of ubuntu apt packages to install
+  system_packages:
+    - "libgl1-mesa-glx"
+    - "libglib2.0-0"
+    - "ffmpeg"
+
+  # python version in the form '3.11' or '3.11.4'
+  python_version: "3.10"
+
+  cuda: "11.8"
+
+  # a list of packages in the format <package-name>==<version>
+  python_packages:
+    # - "numpy==1.19.4"
+    # - "torch==1.8.0"
+    # - "torchvision==0.9.0"
+    - "torch==2.0.1"
+    - "torchvision==0.15.2" 
+    - "torchaudio==2.0.2"
+    - "diffusers==0.27.2"
+    - "accelerate==0.28.0"
+    - "tensorflow==2.12.0"
+    - "tensorboard==2.12.0"
+    - "opencv-python==4.9.0.80"
+    - "soundfile==0.12.1"
+    - "transformers==4.39.2"
+    - "gdown"
+    - "requests"
+    - "imageio[ffmpeg]"
+    - "omegaconf"
+    - "ffmpeg-python"
+    - "pydantic==1.10.*"
+    - "gradio==3.50.*"
+    - "spaces"
+    - "moviepy"
+
+  # commands run after the environment is setup
+  run:
+  #   - "echo env is ready!"
+  #   - "echo another command if needed"
+    - "pip install --no-cache-dir -U openmim"
+    - "mim install mmengine"
+    - 'mim install "mmcv>=2.0.1"'
+    - 'mim install "mmdet>=3.1.0"'
+    - "pip install -U pip setuptools wheel"
+    - 'mim install "mmpose>=1.1.0"'
+
+# predict.py defines how predictions are run on your model
+predict: "predict.py:Predictor"
