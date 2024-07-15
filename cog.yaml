@@ -51,6 +51,9 @@ build:
     - 'mim install "mmdet>=3.1.0"'
     - "pip install -U pip setuptools wheel"
     - 'mim install "mmpose>=1.1.0"'
+    - pip install basicsr
+    - pip install facexlib
+    - git clone https://github.com/TencentARC/GFPGAN.git && cd GFPGAN && pip install -r requirements.txt && python setup.py develop
 
 # predict.py defines how predictions are run on your model
 predict: "predict.py:Predictor"

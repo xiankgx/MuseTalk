@@ -5,15 +5,14 @@ import copy
 import glob
 import os
 import pickle
-import shutil
 import tempfile
-from tqdm.auto import tqdm
 
 import cv2
 import numpy as np
 import torch
 from cog import BasePredictor, Input, Path
-from omegaconf import OmegaConf
+from gfpgan.utils import GFPGANer
+from tqdm.auto import tqdm
 
 from musetalk.utils.blending import get_image
 from musetalk.utils.preprocessing import (
@@ -28,13 +27,20 @@ class Predictor(BasePredictor):
     def setup(self) -> None:
         """Load the model into memory to make running multiple predictions efficient"""
 
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
+
+        print("Loading audio processor, VAE, U-Net, positional encoding...")
         audio_processor, vae, unet, pe = load_all_model()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print("Done!")
         timesteps = torch.tensor([0], device=device)
 
-        pe = pe.half()
-        vae.vae = vae.vae.half()
-        unet.model = unet.model.half()
+        if device == "cuda":
+            print("Putting models on half precision...")
+            pe = pe.half()
+            vae.vae = vae.vae.half()
+            unet.model = unet.model.half()
+            print("Done!")
 
         self.device = device
         self.audio_processor = audio_processor
@@ -43,14 +49,45 @@ class Predictor(BasePredictor):
         self.unet = unet
         self.timesteps = timesteps
 
+        print("Loading GFPGAN...")
+        self.face_enhancer = GFPGANer(
+            # model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.3.pth",
+            # model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/GFPGANv1.4.pth",
+            model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/RestoreFormer.pth",
+            arch="RestoreFormer",
+            upscale=1,
+            device=device,
+        )
+        print("Done!")
+
     def predict(
         self,
         video: Path = Input(description="video path"),
         audio: Path = Input(description="audio path"),
         bbox_shift: int = Input(description="BBox_shift value, px", default=0),
-        cycle: bool = Input(description="Cycle video to smooth the first and last frames.", default=False)
+        cycle: bool = Input(
+            description="Cycle video to smooth the first and last frames.",
+            default=False,
+        ),
+        face_enhance: bool = Input(
+            description="Enhance face with GFPGAN.", default=False
+        ),
     ) -> Path:
+        # def predict(
+        #     self,
+        #     video: str,
+        #     audio: str,
+        #     bbox_shift: int=0,
+        #     cycle: bool=False,
+        #     face_enhance: bool = False
+        # ) -> Path:
         """Run a single prediction on the model"""
+
+        print(f"video: {video}")
+        print(f"audio: {audio}")
+        print(f"bbox_shift: {bbox_shift}")
+        print(f"cycle: {cycle}")
+        print(f"face_enhance: {face_enhance}")
 
         video_path = str(video)
         audio_path = str(audio)
@@ -67,6 +104,13 @@ class Predictor(BasePredictor):
 
         result_dir = tempfile.mkdtemp()
 
+        if audio_path.endswith(".mp4"):
+            print(f"Extracting audio from audio file: {audio_path}...")
+            _audio_path = os.path.join(result_dir, "audio.wav")
+            cmd = f"ffmpeg -v fatal -i {audio_path} {_audio_path}"
+            os.system(cmd)
+            audio_path = _audio_path
+
         result_img_save_path = os.path.join(
             result_dir, output_basename
         )  # related to video & audio inputs
@@ -81,11 +125,31 @@ class Predictor(BasePredictor):
         if get_file_type(video_path) == "video":
             save_dir_full = os.path.join(result_dir, input_basename)
             os.makedirs(save_dir_full, exist_ok=True)
-            cmd = f"ffmpeg -v fatal -i {video_path} -start_number 0 {save_dir_full}/%08d.png"
-            os.system(cmd)
-            input_img_list = sorted(
-                glob.glob(os.path.join(save_dir_full, "*.[jpJP][pnPN]*[gG]"))
+
+            # XXX GX For some reason the number of frames * fps doesn't match the duration!
+            # cmd = f"ffmpeg -v fatal -i {video_path} -start_number 0 {save_dir_full}/%08d.png"
+            # os.system(cmd)
+            # input_img_list = sorted(
+            #     glob.glob(os.path.join(save_dir_full, "*.[jpJP][pnPN]*[gG]"))
+            # )
+
+            video = cv2.VideoCapture(video_path)
+            i = 0
+            while True:
+                ret, frame = video.read()
+                if not ret:
+                    break
+                cv2.imwrite(os.path.join(save_dir_full, f"{i:08d}.png"), frame)
+                i += 1
+            video.release()
+            input_img_list = glob.glob(
+                os.path.join(save_dir_full, "*.[jpJP][pnPN]*[gG]")
             )
+            input_img_list = sorted(
+                input_img_list,
+                key=lambda x: int(os.path.splitext(os.path.basename(x))[0]),
+            )
+
             fps = get_video_fps(video_path)
             print(f"fps: {fps}")
         elif get_file_type(video_path) == "image":
@@ -107,14 +171,18 @@ class Predictor(BasePredictor):
 
         # print(input_img_list)
         ############################################## extract audio feature ##############################################
+
         whisper_feature = audio_processor.audio2feat(audio_path)
         print(f"whisper_feature.shape: {whisper_feature.shape}")
         whisper_chunks = audio_processor.feature2chunks(
             feature_array=whisper_feature, fps=fps
         )
-        print(f"whisper_chunks.shape: {len(whisper_chunks)}, whisper_chunks[0].shape: {whisper_chunks[0].shape}")
+        print(
+            f"whisper_chunks.shape: {len(whisper_chunks)}, whisper_chunks[0].shape: {whisper_chunks[0].shape}"
+        )
 
         ############################################## preprocess input image  ##############################################
+
         # if os.path.exists(crop_coord_save_path) and args.use_saved_coord:
         if os.path.exists(crop_coord_save_path):
             print("using extracted coordinates")
@@ -190,23 +258,32 @@ class Predictor(BasePredictor):
             x1, y1, x2, y2 = bbox
             try:
                 res_frame = cv2.resize(res_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                if face_enhance:
+                    # print("face enhance...")
+                    _, _, res_frame = self.face_enhancer.enhance(
+                        res_frame,
+                        has_aligned=False,
+                        only_center_face=True,
+                        paste_back=True,
+                        weight=1.0,
+                    )
             except Exception as e:
                 # print(bbox)
                 print(f"Exception: {str(e)}")
                 continue
 
             combine_frame = get_image(ori_frame, res_frame, bbox)
+            # if face_enhance:
+            #     print("face enhance...")
+            #     _, _, combine_frame = self.face_enhancer.enhance(combine_frame, has_aligned=False, only_center_face=False, paste_back=True, weight=1.0)
             cv2.imwrite(f"{result_img_save_path}/{str(i).zfill(8)}.png", combine_frame)
-
 
         cmd_img2video = f"ffmpeg -y -v warning -r {fps} -f image2 -i {result_img_save_path}/%08d.png -vcodec libx264 -vf format=rgb24,scale=out_color_matrix=bt709,format=yuv420p -crf 18 temp.mp4"
         print(cmd_img2video)
         os.system(cmd_img2video)
 
         # f"ffmpeg -y -v warning -i {audio_path} -i temp.mp4 {output_vid_name}"
-        cmd_combine_audio = (
-            f"ffmpeg -y -v warning -i {audio_path} -i temp.mp4 -shortest {output_vid_name}"
-        )
+        cmd_combine_audio = f"ffmpeg -y -v warning -i {audio_path} -i temp.mp4 -shortest {output_vid_name}"
         print(cmd_combine_audio)
         os.system(cmd_combine_audio)
 
@@ -215,3 +292,9 @@ class Predictor(BasePredictor):
         # print(f"result is save to {output_vid_name}")
 
         return Path(output_vid_name)
+
+
+if __name__ == "__main__":
+    predictor = Predictor()
+    predictor.setup()
+    predictor.predict(video="VID-20240517-WA0007.mp4", audio="warren-bad.mp4")

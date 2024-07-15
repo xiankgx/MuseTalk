@@ -147,8 +147,12 @@ class AudioEncoder(nn.Module):
         include_embeddings: bool
             whether to include intermediate steps in the output
         """
+        batch_size, n_mels, n_ctx = x.shape
+        # print(f"n_mels: {n_mels}, n_ctx: {n_ctx}")
+
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
+        # GX comment: 0, c, l -> 0, l, c
         x = x.permute(0, 2, 1)
 
         assert x.shape[1:] == self.positional_embedding.shape, "incorrect audio shape"
@@ -165,6 +169,7 @@ class AudioEncoder(nn.Module):
         x = self.ln_post(x)
 
         if include_embeddings:
+            # print(f"len(embeddings): {len(embeddings)}")
             embeddings = np.stack(embeddings, axis=1)
             return x, embeddings
         else:

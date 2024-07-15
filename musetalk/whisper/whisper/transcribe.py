@@ -83,6 +83,7 @@ def transcribe(
         decode_options["fp16"] = False
 
     mel = log_mel_spectrogram(audio)
+    # print(f"mel.shape: {mel.shape}")
    
     all_segments = []
     def add_segment(
@@ -105,7 +106,9 @@ def transcribe(
         while seek < num_frames:
             # seek是开始的帧数
             end_seek = min(seek + sample_skip, num_frames)
-            segment = pad_or_trim(mel[:,seek:seek+sample_skip], N_FRAMES).to(model.device).to(dtype)
+            _segment = mel[:,seek:seek+sample_skip]
+            segment = pad_or_trim(_segment, N_FRAMES).to(model.device).to(dtype)
+            # print(f"_segment.shape: {_segment.shape}, segment.shape: {segment.shape}")
             
             single = segment.ndim == 2
             if single:
@@ -115,7 +118,8 @@ def transcribe(
             audio_features, embeddings  = model.encoder(segment, include_embeddings = True)
             
             encoder_embeddings = embeddings
-            #print(f"encoder_embeddings shape {encoder_embeddings.shape}")
+            # print(f"audio_features shape {audio_features.shape}")
+            # print(f"encoder_embeddings shape {embeddings.shape}")
             add_segment(
                 start=seek,
                 end=end_seek,
