@@ -1,143 +1,177 @@
 import glob
 import os
 import pickle
+import time
 
-import cv2
 import numpy as np
+from PIL import Image
 from torch.utils.data import Dataset
+from torchvision import transforms
 
-from musetalk.utils.preprocessing import (
-    coord_placeholder,
-    get_landmark_and_bbox,
-    read_imgs,
+
+def crop_image(image: Image.Image, bbox) -> Image.Image:
+    image_np = np.array(image)
+    x1, y1, x2, y2 = bbox
+    return Image.fromarray(image_np[y1:y2, x1:x2])
+
+
+def random_mask_for_image(image: Image.Image) -> Image.Image:
+    w, h = image.size
+    mask_np = np.full((h, w), fill_value=255, dtype=np.uint8)
+
+    y_start = int((0.4 + np.random.rand() * 0.2) * h)
+    y_end = int((0.83 + np.random.rand() * (1 - 0.83)) * h)
+
+    x_start = int((0.0 + np.random.rand() * 0.25) * w)
+    x_end = int((0.75 + np.random.rand() * 0.25) * w)
+
+    mask_np[y_start:y_end, x_start:x_end] = 0
+
+    return Image.fromarray(mask_np)
+
+
+IMAGE_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ]
 )
-from musetalk.utils.utils import get_video_fps
-
-
-def read_frames(video_path):
-    frames = []
-    video = cv2.VideoCapture(video_path)
-    while True:
-        ret, frame = video.read()
-        if not ret:
-            break
-        frames.append(frame)
-    video.release()
-    return frames
+MASK_TRANSFORM = transforms.Compose(
+    [
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+    ]
+)
 
 
 class HDTFDataset(Dataset):
-    def __init__(self, video_paths, audio_processor, bbox_shift: int = 0):
-        self.video_paths = video_paths
-        self.bbox_shift = bbox_shift
-        self.audio_processor = audio_processor
+    def __init__(
+        self,
+        frame_paths,
+        image_transform=IMAGE_TRANSFORM,
+        mask_transform=MASK_TRANSFORM,
+    ):
+        
+        self.image_transform = image_transform
+        self.mask_transform = mask_transform
 
+        self.frame_paths = frame_paths
+        # self.data_root = data_root
+        # video_dirs = os.listdir(self.data_root)
+        # print(f"video_dirs: {video_dirs}")
+        # self.video_dirs = video_dirs
+        
     def __len__(self):
-        return len(self.video_paths)
+        # return len(self.video_dirs)
+        return len(self.frame_paths)
 
     def __getitem__(self, idx):
-        video_path = self.video_paths[idx]
-        audio_path = self.video_paths[idx]
+        frame_path = self.frame_paths[idx]
 
-        cache_dir = os.path.join(
-            os.path.dirname(video_path),
-            ".cache",
-            os.path.splitext(os.path.basename(video_path))[0],
+        video_dir = os.path.dirname(os.path.dirname(frame_path))
+        # video_dir = os.path.join(self.data_root, self.video_dirs[idx])
+
+        audio_features_count_path = os.path.join(video_dir, "audio_features", "count.pkl")
+        with open(audio_features_count_path, "rb") as f:
+            num_audio_features = pickle.load(f)
+
+        # tic = time.time()
+        coord_list_path = os.path.join(video_dir, "coord_list.pkl")
+        with open(coord_list_path, "rb") as f:
+            coord_list = pickle.load(f)
+            # print(f"coord_list time: {time.time() - tic}")
+        num_frames = min(num_audio_features, len(coord_list))
+
+        frame_num = int(os.path.splitext(os.path.basename(frame_path))[0])
+        if frame_num >= num_frames:
+            frame_num = np.random.randint(num_frames)
+        x1, y1, x2, y2 = coord_list[frame_num]
+        while (x2 - x1 <= 0) or (y2 - y1 <= 0):
+            print("while1")
+            frame_num = np.random.randint(num_frames)
+            x1, y1, x2, y2 = coord_list[frame_num]
+
+        ref_frame_num = np.random.randint(num_frames)
+        x1_ref, y1_ref, x2_ref, y2_ref = coord_list[ref_frame_num]
+        while (x2_ref - x1_ref <= 0) or (y2_ref - y1_ref <= 0):
+            print("while2")
+            ref_frame_num = np.random.randint(num_frames)
+            x1_ref, y1_ref, x2_ref, y2_ref = coord_list[ref_frame_num]
+
+        frame_path = os.path.join(video_dir, "frames", f"{frame_num:08d}.jpg")
+        ref_frame_path = os.path.join(video_dir, "frames", f"{ref_frame_num:08d}.jpg")
+        audio_features_path = os.path.join(video_dir, "audio_features", f"{frame_num:08d}.pkl")
+    
+        frame = crop_image(Image.open(frame_path), (x1, y1, x2, y2))
+        ref_frame = crop_image(
+            Image.open(ref_frame_path), (x1_ref, y1_ref, x2_ref, y2_ref)
         )
-        os.makedirs(cache_dir, exist_ok=True)
+        mask = random_mask_for_image(frame)
 
-        frames_save_path = os.path.join(cache_dir, "frames")
-        if not os.path.isdir(frames_save_path):
-            os.makedirs(frames_save_path)
-
-            video = cv2.VideoCapture(video_path)
-            i = 0
-            while True:
-                ret, frame = video.read()
-                if not ret:
-                    break
-                cv2.imwrite(os.path.join(frames_save_path, f"{i:08d}.png"), frame)
-                i += 1
-            video.release()
-
-        input_img_list = sorted(
-            glob.glob(os.path.join(frames_save_path, "*.[jpJP][pnPN]*[gG]"))
+        masked_frame = Image.fromarray(
+            (np.array(frame) * (np.array(mask)[..., None] / np.float32(255))).astype(
+                np.uint8
+            )
         )
-        fps = get_video_fps(video_path)
 
-        # Get crop coordinates, use cache if available
-        crop_coord_save_path = os.path.join(cache_dir, "coord_list.pkl")
-        if os.path.isfile(crop_coord_save_path):
-            with open(crop_coord_save_path, "rb") as f:
-                coord_list = pickle.load(f)
-            frame_list = read_imgs(input_img_list)
-        else:
-            # print(f"input_img_list: {input_img_list}")
-            coord_list, frame_list = get_landmark_and_bbox(
-                input_img_list, self.bbox_shift
-            )
-            with open(crop_coord_save_path, "wb") as f:
-                pickle.dump(coord_list, f)
-        assert len(coord_list) == len(frame_list)
+        with open(audio_features_path, "rb") as f:
+            audio_feature = pickle.load(f)
+            # print(f"audio_features time: {time.time() - tic}")
 
-        crop_frames_save_path = os.path.join(cache_dir, "cropped_frames")
-        if not os.path.isdir(crop_frames_save_path):
-            os.makedirs(crop_frames_save_path)
+        if self.image_transform:
+            ref_frame = self.image_transform(ref_frame)
+            frame = self.image_transform(frame)
+            masked_frame = self.image_transform(masked_frame)
+        if self.mask_transform:
+            mask = self.mask_transform(mask)
 
-            for i, (bbox, frame) in enumerate(zip(coord_list, frame_list)):
-                if bbox == coord_placeholder:
-                    print("FAIL TO DETECT FACE, REPLACING WITH ALL ZERO IMAGE")
-                    # continue
-                    crop_frame = np.zeros((256, 256, 3), np.uint8)
-                else:
-                    x1, y1, x2, y2 = bbox
-                    crop_frame = frame[y1:y2, x1:x2]
-
-                crop_frame = cv2.resize(
-                    crop_frame, (256, 256), interpolation=cv2.INTER_LANCZOS4
-                )
-                cv2.imwrite(
-                    os.path.join(crop_frames_save_path, f"{i:08d}.png"), crop_frame
-                )
-        cropped_frames = sorted(glob.glob(f"{crop_frames_save_path}/*.*"))
-        assert len(cropped_frames) == len(frame_list)
-
-        whisper_feature_save_path = os.path.join(cache_dir, "audio_features.pkl")
-        if os.path.isfile(whisper_feature_save_path):
-            with open(whisper_feature_save_path, "rb") as f:
-                whisper_chunks = pickle.load(f)
-        else:
-            # np.ndarray
-            whisper_feature = self.audio_processor.audio2feat(audio_path)
-            print(f"whisper_feature.shape: {whisper_feature.shape}")
-            # list of np.ndarray
-            whisper_chunks = self.audio_processor.feature2chunks(
-                feature_array=whisper_feature, fps=fps
-            )
-            print(f"whisper_chunks.shape: {len(whisper_chunks)}")
-            print(f"whisper_chunks[0].shape: {whisper_chunks[0].shape}")
-            with open(whisper_feature_save_path, "wb") as f:
-                pickle.dump(whisper_chunks, f)
-
-        return {
-            "video_path": video_path,
-            # "audio_path": audio_path,
-            "fps": fps,
-            "num_frames": len(frame_list),
-            "audio_feature": whisper_chunks
-            # "num_audio_frames": len(whisper_chunks)
-        }
+        # ref_image, image, masked_image, masks, audio_feature
+        # return {
+        #     "ref_image": ref_frame,
+        #     "image": frame,
+        #     "masked_image": masked_frame,
+        #     "mask": mask,
+        #     # 10 audio frames, by 1 by 384 * 5 (diff output layers)
+        #     "audio_feature": audio_feature.reshape(10, 384 * 5),
+        # }
+        return ref_frame, frame, masked_frame, mask, audio_feature.reshape(10, 384 * 5)
+        # return ref_frame, frame
 
 
 if __name__ == "__main__":
-    from musetalk.whisper.audio2feature import Audio2Feature
+    frames_paths = glob.glob("HDTF_train_processed/**/frames/*.jpg", recursive=True)
+    print(f"# num frames: {len(frames_paths)}")
 
-    audio_processor = Audio2Feature(model_path="models/whisper/tiny.pt")
-    ds = HDTFDataset(
-        video_paths=[
-            "VID-20240517-WA0007.mp4",
-        ],
-        audio_processor=audio_processor,
-    )
-    sample = ds[0]
-    print(sample)
+    ds = HDTFDataset("HDTF_train_processed")
+    # sample = ds[np.random.randint(len(ds))]
+
+    
+    from tqdm.auto import tqdm
+    # dl = DataLoader(ds, batch_size=4, shuffle=True, num_workers=8)
+
+    # for batch in tqdm(dl):
+    #     continue
+
+    # for sample in tqdm(ds):
+    #     print(sample)
+    #     continue
+
+    from torch.utils.data import DataLoader
+    dl = DataLoader(ds, batch_size=4, shuffle=False, num_workers=1)
+    for sample in tqdm(dl):
+        _ = sample
+        # continue
+
+    # print(sample)
+    # ref_image = sample["ref_image"]
+    # image = sample["image"]
+    # masked_image = sample["masked_image"]
+    # mask = sample["mask"]
+    # audio_feature = sample["audio_feature"]
+
+    # ref_image.save("ref_image.jpg")
+    # image.save("image.jpg")
+    # masked_image.save("masked_image.jpg")
+    # mask.save("mask.png")
+    # print(f"audio_feature.shape: {audio_feature.shape}")

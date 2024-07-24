@@ -34,8 +34,9 @@ def resize_landmark(landmark, w, h, new_w, new_h):
 
 def read_imgs(img_list):
     frames = []
-    print('reading images...')
-    for img_path in tqdm(img_list):
+    # print('reading images...')
+    # for img_path in tqdm(img_list):
+    for img_path in img_list:
         frame = cv2.imread(img_path)
         frames.append(frame)
     return frames
@@ -82,9 +83,12 @@ def get_bbox_range(img_list,upperbondrange =0):
     
 
 def get_landmark_and_bbox(img_list,upperbondrange =0):
-    frames = read_imgs(img_list)
+    # frames = read_imgs(img_list)
     batch_size_fa = 1
-    batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+    # batches = [frames[i:i + batch_size_fa] for i in range(0, len(frames), batch_size_fa)]
+    batches = [img_list[i:i + batch_size_fa] for i in range(0, len(img_list), batch_size_fa)]
+    # GX
+    coords_list_mouth = []
     coords_list = []
     landmarks = []
     if upperbondrange != 0:
@@ -93,12 +97,18 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
         print('get key_landmark and face bounding boxes with the default value')
     average_range_minus = []
     average_range_plus = []
-    for fb in tqdm(batches):
+    # for fb in tqdm(batches):
+    for fb in batches:
+        fb = read_imgs(fb)  # XXX GX
         results = inference_topdown(model, np.asarray(fb)[0])
         results = merge_data_samples(results)
         keypoints = results.pred_instances.keypoints
         face_land_mark= keypoints[0][23:91]
         face_land_mark = face_land_mark.astype(np.int32)
+
+        # GX
+        mouth_land_mark = face_land_mark[-19:]
+        # print(f"mouth_land_mark: {mouth_land_mark}")
         
         # get bounding boxes by face detetion
         bbox = fa.get_detections_for_batch(np.asarray(fb))
@@ -108,6 +118,7 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
         for j, f in enumerate(bbox):
             if f is None: # no face in the image
                 coords_list += [coord_placeholder]
+                coords_list_mouth.append(mouth_land_mark)
                 continue
             
             half_face_coord =  face_land_mark[29]#np.mean([face_land_mark[28], face_land_mark[29]], axis=0)
@@ -129,11 +140,14 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
                 print("error bbox:",f)
             else:
                 coords_list += [f_landmark]
+
+            coords_list_mouth.append(mouth_land_mark)
     
     print("********************************************bbox_shift parameter adjustment**********************************************************")
-    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+    print(f"Total frame:「{len(img_list)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
     print("*************************************************************************************************************************************")
-    return coords_list,frames
+    return coords_list,img_list,coords_list_mouth
+    # return coords_list,frames,coords_list_mouth
     
 
 if __name__ == "__main__":

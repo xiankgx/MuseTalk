@@ -29,12 +29,33 @@ class Audio2Feature():
         selected_feature = []
         selected_idx = []
         
-        center_idx = int(vid_idx*50/fps) 
+        center_idx = int(round(vid_idx*50/fps))
         left_idx = center_idx-audio_feat_length[0]*2
         right_idx = center_idx + (audio_feat_length[1]+1)*2
-        print(f"vid_idx*50/fps: {vid_idx*50/fps}, center_idx: {center_idx}, left_idx: {left_idx}, right_idx: {right_idx}")
+        # print(f"vid_idx*50/fps: {vid_idx*50/fps}, center_idx: {center_idx}, left_idx: {left_idx}, right_idx: {right_idx}")
         
+        # XXX GX HACK
         for idx in range(left_idx,right_idx):
+        # for idx in [
+        #     # center_idx-2, center_idx-1, 
+        #     # center_idx-1, center_idx, 
+        #     # center_idx, center_idx+1, 
+        #     # center_idx+1, center_idx+2, 
+        #     # center_idx+2, center_idx+3
+
+        #     # jumpy
+        #     # center_idx, center_idx, 
+        #     # center_idx, center_idx, 
+        #     # center_idx, center_idx+1, 
+        #     # center_idx+1, center_idx+1, 
+        #     # center_idx+1, center_idx+1
+
+        #     center_idx - 2, center_idx -2, 
+        #     center_idx -1, center_idx -1, 
+        #     center_idx, center_idx, 
+        #     center_idx +1, center_idx + 1, 
+        #     center_idx +2, center_idx + 2
+        # ]:
             idx = max(0, idx)
             idx = min(length-1, idx)
             x = feature_array[idx]
@@ -90,7 +111,7 @@ class Audio2Feature():
             if start_idx >= len(feature_array):
                 break
             selected_feature,selected_idx = self.get_sliced_feature(feature_array= feature_array,vid_idx = i,audio_feat_length=audio_feat_length,fps=fps)
-            print(f"i:{i},selected_idx {selected_idx}")
+            # print(f"i:{i},selected_idx {selected_idx}")
             whisper_chunks.append(selected_feature)
             i += 1
             # if start_idx>len(feature_array):
@@ -106,9 +127,9 @@ class Audio2Feature():
         # print(f"num_segments: {len(result['segments'])}")
 
         for emb in result['segments']:
-            print(f'start: {emb["start"]}')
-            print(f'end: {emb["end"]}')
-            print(f'encoder_embeddings.shape: {emb["encoder_embeddings"].shape}')
+            # print(f'start: {emb["start"]}')
+            # print(f'end: {emb["end"]}')
+            # print(f'encoder_embeddings.shape: {emb["encoder_embeddings"].shape}')
 
             encoder_embeddings = emb['encoder_embeddings']
             encoder_embeddings = encoder_embeddings.transpose(0,2,1,3)
@@ -120,25 +141,51 @@ class Audio2Feature():
         concatenated_array = np.concatenate(embed_list, axis=0)
         return concatenated_array
 
+    def audio2feat_gx(self,audio_path):
+        # get the sample rate of the audio
+        result = self.model.transcribe(audio_path)
+        embed_list = []
+
+        # print(f"num_segments: {len(result['segments'])}")
+
+        for emb in result['segments']:
+            print(f'start: {emb["start"]}')
+            print(f'end: {emb["end"]}')
+            print(f'encoder_embeddings.shape: {emb["encoder_embeddings"].shape}')
+
+            encoder_embeddings = emb['encoder_embeddings']
+            # XXX encoder_embeddings.shape: (1, 5, 1500, 384)
+            encoder_embeddings = encoder_embeddings.transpose(0,2,1,3)
+            encoder_embeddings = encoder_embeddings.squeeze(0)
+            encoder_embeddings = encoder_embeddings.reshape(encoder_embeddings.shape[0], -1)
+            start_idx = int(emb['start'])
+            end_idx = int(emb['end'])
+            emb_end_idx = int((end_idx - start_idx)/2)  # GX divide 2 here because input seq length 3000 gets reduced to 1500
+            embed_list.append(encoder_embeddings[:emb_end_idx])
+        concatenated_array = np.concatenate(embed_list, axis=0)
+        return concatenated_array
+
 if __name__ == "__main__":
-    audio_processor = Audio2Feature(model_path="../models/whisper/tiny.pt")
+    audio_processor = Audio2Feature(model_path="models/whisper/tiny.pt")
     # audio_path = "./test.mp3"
-    audio_path = "../1.wav"
-    array = audio_processor.audio2feat(audio_path)
+    audio_path = "1.wav"
+    # XXX
+    # array = audio_processor.audio2feat(audio_path)
+    array = audio_processor.audio2feat_gx(audio_path)
     print(array.shape)
     # fps = 25
     fps = 22.131147540983605
     whisper_idx_multiplier = 50./fps 
 
-    i = 0
-    print(f"video in {fps} FPS, audio idx in 50FPS")
-    while 1:
-        print(f"i: {i}")
-        start_idx = int(i * whisper_idx_multiplier)
-        if start_idx >= len(array):
-            break
-        selected_feature,selected_idx = audio_processor.get_sliced_feature(feature_array= array,vid_idx = i,audio_feat_length=[2,2],fps=fps)
-        # print(f"video idx {i},\t audio idx {selected_idx},\t shape {selected_feature.shape}")
-        i += 1
+    # i = 0
+    # print(f"video in {fps} FPS, audio idx in 50FPS")
+    # while 1:
+    #     print(f"i: {i}")
+    #     start_idx = int(round(i * whisper_idx_multiplier))
+    #     if start_idx >= len(array):
+    #         break
+    #     selected_feature,selected_idx = audio_processor.get_sliced_feature(feature_array= array,vid_idx = i,audio_feat_length=[2,2],fps=fps)
+    #     # print(f"video idx {i},\t audio idx {selected_idx},\t shape {selected_feature.shape}")
+    #     i += 1
 
-    print(i)
+    # print(i)
