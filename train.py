@@ -4,6 +4,7 @@ import itertools
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
+from huggingface_hub import create_repo
 from torch.utils import data as data_utils
 from tqdm.auto import tqdm
 
@@ -32,12 +34,34 @@ check_min_version("0.13.0.dev0")
 logger = get_logger(__name__)
 
 
+def adapt_state_dict(src_state_dict, tgt_state_dict):
+    """Adapt the source state dict to target state dict."""
+    new_state_dict = {}
+    for k in tgt_state_dict.keys():
+        tgt_v = tgt_state_dict[k]
+        src_v = src_state_dict[k]
+
+        if tgt_v.shape == src_v.shape:
+            new_state_dict[k] = src_v
+        else:
+            print(f"k: {k} - old: {src_v.shape} new: {tgt_v.shape}")
+            new_v = torch.randn_like(tgt_v)
+            new_v[
+                : min(tgt_v.size(0), src_v.size(0)), : min(tgt_v.size(1), src_v.size(1))
+            ] = src_v[
+                : min(tgt_v.size(0), src_v.size(0)), : min(tgt_v.size(1), src_v.size(1))
+            ]
+            new_state_dict[k] = new_v
+    return new_state_dict
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--unet_config_file",
         type=str,
         default="./musetalk.json",
+        # default="./models/musetalk/musetalk.json",
         # required=True,
         help="the configuration of unet file.",
     )
@@ -291,7 +315,7 @@ def main():
 
     if args.seed is not None:
         #         set_seed(args.seed)
-        set_seed(seed + accelerator.process_index)
+        set_seed(args.seed + accelerator.process_index)
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -305,7 +329,6 @@ def main():
                 token=args.hub_token,
             ).repo_id
 
-    # Todo:
     print("Loading AutoencoderKL")
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae"
@@ -313,11 +336,15 @@ def main():
     vae_fp32 = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae"
     )
+
     print("Loading UNet2DConditionModel")
     # Load models and create wrapper for stable diffusion
     with open(args.unet_config_file, "r") as f:
         unet_config = json.load(f)
     unet = UNet2DConditionModel(**unet_config)
+    # unet = UNet2DConditionModel.from_pretrained("models/musetalk")
+    # state_dict = torch.load("models/musetalk/pytorch_model.bin", map_location="cpu")
+    # unet.load_state_dict(adapt_state_dict(state_dict, unet.state_dict()), strict=False)
 
     if args.whisper_model_type == "tiny":
         # position_encoder = PositionalEncoding(d_model=384)
@@ -494,7 +521,7 @@ def main():
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
 
-        for step, (ref_image, image, masked_image, masks, audio_feature) in enumerate(
+        for step, (ref_image, image, _, mask, audio_feature) in enumerate(
             train_data_loader
         ):
             # Skip steps until we reach the resumed step
@@ -510,11 +537,9 @@ def main():
             dataloader_time = time.time() - start
             start = time.time()
 
-            # masks = masks.unsqueeze(1).unsqueeze(1).to(vae.device)
-            # ref_image = preprocess_img_tensor(ref_image).to(vae.device)
-            # image = preprocess_img_tensor(image).to(vae.device)
-            # masked_image = preprocess_img_tensor(masked_image).to(vae.device)
-            masks = masks.to(vae.device)
+            inverse_mask = 1.0 - mask
+            masked_image = image * mask
+            mask = mask.to(vae.device)
             ref_image = ref_image.to(vae.device)
             image = image.to(vae.device)
             masked_image = masked_image.to(vae.device)
@@ -555,8 +580,8 @@ def main():
                 vae_time = time.time() - start
                 start = time.time()
 
-                masks = torch.nn.functional.interpolate(
-                    masks, size=masked_latents.shape[-2]
+                resized_mask = torch.nn.functional.interpolate(
+                    mask, size=masked_latents.shape[-2], mode="nearest"
                 )
 
                 bsz = latents.shape[0]
@@ -572,7 +597,7 @@ def main():
 
                 if unet_config["in_channels"] == 9:
                     latent_model_input = torch.cat(
-                        [masks, masked_latents, ref_latents], dim=1
+                        [resized_mask, masked_latents, ref_latents], dim=1
                     )
                 else:
                     latent_model_input = torch.cat([masked_latents, ref_latents], dim=1)
@@ -586,31 +611,32 @@ def main():
                     latent_model_input, timesteps, encoder_hidden_states=audio_feature
                 ).sample
 
+                loss = F.mse_loss(image_pred.float(), latents.float(), reduction="mean")
+
                 if args.reconstruction:  # decode the image from the predicted latents
                     image_pred_img = (1 / vae_fp32.config.scaling_factor) * image_pred
                     image_pred_img = vae_fp32.decode(image_pred_img).sample
 
-                    # Mask the top half of the image and calculate the loss only for the lower half of the image.
-                    image_pred_img = image_pred_img[
-                        :, :, image_pred_img.shape[2] // 2 :, :
-                    ]
-                    image = image[:, :, image.shape[2] // 2 :, :]
+                    # XXX GX disable
+                    # # Mask the top half of the image and calculate the loss only for the lower half of the image.
+                    # image_pred_img = image_pred_img[
+                    #     :, :, image_pred_img.shape[2] // 2 :, :
+                    # ]
+                    # image = image[:, :, image.shape[2] // 2 :, :]
+
+                    # loss_lip = F.l1_loss(
+                    #     (image_pred_img * inverse_mask).float(),
+                    #     (image * inverse_mask).float(),
+                    #     reduction="mean",
+                    # )  # the loss of the decoded images
+
                     loss_lip = F.l1_loss(
-                        image_pred_img.float(), image.float(), reduction="mean"
-                    )  # the loss of the decoded images
-                    loss_latents = F.l1_loss(
-                        image_pred.float(), latents.float(), reduction="mean"
-                    )  # the loss of the latents
-
-                    loss = (
-                        2.0 * loss_lip + loss_latents
-                    )  # add some weight to balance the loss
-
-                else:
-                    loss = F.mse_loss(
-                        image_pred.float(), latents.float(), reduction="mean"
+                        image_pred_img[(inverse_mask > 0.5).expand_as(image_pred_img)].float(),
+                        image[(inverse_mask > 0.5).expand_as(image)].float(),
+                        reduction="mean"
                     )
-                #
+
+                    loss = loss + 2.0 * loss_lip  # add some weight to balance the loss
 
                 unet_elapsed_time = time.time() - start
                 start = time.time()
@@ -649,6 +675,25 @@ def main():
                         )
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+
+                        def get_checkpoint_global_step(path: str) -> int:
+                            return int(
+                                os.path.basename(path).replace("checkpoint-", "")
+                            )
+
+                        checkpoint_dirs = glob.glob(
+                            os.path.join(args.output_dir, "checkpoint-*")
+                        )
+                        checkpoint_steps = list(
+                            map(get_checkpoint_global_step, checkpoint_dirs)
+                        )
+                        checkpoint_dirs = np.array(checkpoint_dirs)[
+                            np.argsort(checkpoint_steps)
+                        ].tolist()[::-1]
+                        if args.checkpoints_total_limit is not None:
+                            for dir in checkpoint_dirs[args.checkpoints_total_limit :]:
+                                print(f"Removing checkpoint dir: {dir}")
+                                shutil.rmtree(dir)
 
                 if global_step % args.validation_steps == 0:
                     if accelerator.is_main_process:
@@ -699,8 +744,11 @@ def main():
             if global_step >= args.max_train_steps:
                 break
 
-        accelerator.wait_for_everyone()
+    accelerator.wait_for_everyone()
     accelerator.end_training()
+
+    if accelerator.is_main_process and args.push_to_hub:
+        accelerator.unwrap_model(unet).push_to_hub(repo_id=repo_id)
 
 
 if __name__ == "__main__":

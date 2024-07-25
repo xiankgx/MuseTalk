@@ -73,14 +73,12 @@ def validation(
 
     start = time.time()
     with torch.no_grad():
-        for step, (ref_image, image, masked_image, masks, audio_feature) in enumerate(
+        for step, (ref_image, image, _, mask, audio_feature) in enumerate(
             val_data_loader
         ):
-            # masks = masks.unsqueeze(1).unsqueeze(1).to(vae.device)
-            # ref_image = preprocess_img_tensor(ref_image).to(vae.device)
-            # image = preprocess_img_tensor(image).to(vae.device)
-            # masked_image = preprocess_img_tensor(masked_image).to(vae.device)
-            masks = masks.to(vae.device)
+            masked_image = image * mask
+
+            mask = mask.to(vae.device)
             ref_image = ref_image.to(vae.device)
             image = image.to(vae.device)
             masked_image = masked_image.to(vae.device)
@@ -110,16 +108,14 @@ def validation(
             #     ]
             # )
             # mask = mask.reshape(-1, 1, mask.shape[-1], mask.shape[-1])
-            masks = torch.nn.functional.interpolate(
-                masks, size=masked_latents.shape[-2]
-            )
+            mask = torch.nn.functional.interpolate(mask, size=masked_latents.shape[-2])
 
             bsz = latents.shape[0]
             timesteps = torch.tensor([0], device=latents.device)
 
             if unet_config["in_channels"] == 9:
                 latent_model_input = torch.cat(
-                    [masks.to(dtype=masked_latents.dtype), masked_latents, ref_latents],
+                    [mask.to(dtype=masked_latents.dtype), masked_latents, ref_latents],
                     dim=1,
                 )
             else:
@@ -146,13 +142,23 @@ def validation(
             image.paste(decode_latents(vae_fp32, latents), (RESIZED_IMG * 2, 0))
             image.paste(decode_latents(vae_fp32, image_pred), (RESIZED_IMG * 3, 0))
 
-            val_img_dir = f"images/{output_dir}/{global_step}"
+            val_img_dir = f"{output_dir}/images/{global_step}"
             if not os.path.exists(val_img_dir):
                 os.makedirs(val_img_dir)
             image.save(
-                "{0}/val_epoch_{1}_{2}_image.png".format(val_img_dir, global_step, step)
+                # "{0}/val_epoch_{1}_{2}_image.png".format(val_img_dir, global_step, step)
+                os.path.join(
+                    val_img_dir,
+                    f"validation-global_step={global_step:09d}-{step:04d}.jpg",
+                )
             )
 
-            print("valtion in step:{0}, time:{1}".format(step, time.time() - start))
+            print(
+                "validation for step: {0}, time: {1:.1f} s".format(step, time.time() - start)
+            )
 
-        print("valtion_done in epoch:{0}, time:{1}".format(epoch, time.time() - start))
+        print(
+            "validation done for epoch: {0}, time: {1:.1f} s".format(
+                epoch, time.time() - start
+            )
+        )
