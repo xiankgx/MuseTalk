@@ -1,3 +1,11 @@
+"""
+Changes:
+
+1. Changed audio features from shape: b, 50, 384 to shape: b, 10, 1920. Reason being the original code uses 10 audio frames where each frame consists of a stack of 5 output layers from whisper encoder. To me, 5 output layers don't correspond to the sequence.
+2. Changed masking of frames from BEFORE image normalization (black masked area) to AFTER image normalization (gray masked area).
+3. Chaged Unet input channels from 8 to 9.
+"""
+
 import argparse
 import glob
 import itertools
@@ -19,11 +27,13 @@ from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version
 from huggingface_hub import create_repo
+from PIL import Image
 from torch.utils import data as data_utils
 from tqdm.auto import tqdm
 
 from dataset import HDTFDataset
-from train_utils.model_utils import PositionalEncoding, validation
+from musetalk.models.unet import PositionalEncoding
+from train_utils.model_utils import validation
 
 # from DataLoader import Dataset
 # from train_utils.utils import preprocess_img_tensor
@@ -32,6 +42,150 @@ from train_utils.model_utils import PositionalEncoding, validation
 check_min_version("0.13.0.dev0")
 
 logger = get_logger(__name__)
+
+
+def decode_latents(vae, latents, ref_images=None):
+    latents = (1 / 0.18215) * latents
+    image = vae.decode(latents.to(vae.dtype)).sample
+    image = (image / 2 + 0.5).clamp(0, 1)
+    image = image.detach().cpu().permute(0, 2, 3, 1).float().numpy()
+    image = (image * 255).round().astype("uint8")
+    if ref_images is not None:
+        ref_images = ref_images.detach().cpu().permute(0, 2, 3, 1).float().numpy()
+        ref_images = (ref_images * 255).round().astype("uint8")
+        h = image.shape[1]
+        image[:, : h // 2] = ref_images[:, : h // 2]
+    image = [Image.fromarray(im) for im in image]
+    return image[0]
+
+
+def validation(
+    vae: torch.nn.Module,
+    vae_fp32: torch.nn.Module,
+    unet: torch.nn.Module,
+    unet_config,
+    weight_dtype: torch.dtype,
+    epoch: int,
+    global_step: int,
+    val_data_loader,
+    output_dir,
+    whisper_model_type,
+    UNet2DConditionModel=UNet2DConditionModel,
+    image_size: int = 256,
+):
+    # Get the validation pipeline
+    unet_copy = UNet2DConditionModel(**unet_config)
+    unet_copy.load_state_dict(unet.state_dict())
+    unet_copy.to(vae.device).to(dtype=weight_dtype)
+    unet_copy.eval()
+
+    if whisper_model_type == "tiny":
+        # pe = PositionalEncoding(d_model=384)
+        # XXX GX
+        # Instead of 5 (layers) x 384 for each audio feature, I'm converting it to 1 x 1920 because we are later using another level of multi-features with using neighboring audio features.
+        # With this change, using 10 audio frames, the audio feature become of shape 10 x 1920, rather than 50 x 384.
+        pe = PositionalEncoding(d_model=384 * 5)
+    elif whisper_model_type == "largeV2":
+        pe = PositionalEncoding(d_model=1280)
+    elif whisper_model_type == "tiny-conv":
+        pe = PositionalEncoding(d_model=384)
+        print(f" whisper_model_type: {whisper_model_type} Validation does not need PE")
+    else:
+        print(f"not support whisper_model_type {whisper_model_type}")
+    pe.to(vae.device, dtype=weight_dtype)
+
+    start = time.time()
+    with torch.no_grad():
+        for step, (ref_image, image, _, mask, audio_feature) in enumerate(
+            val_data_loader
+        ):
+            masked_image = image * mask
+
+            mask = mask.to(vae.device)
+            ref_image = ref_image.to(vae.device)
+            image = image.to(vae.device)
+            masked_image = masked_image.to(vae.device)
+
+            # Convert images to latent space
+            latents = vae.encode(
+                image.to(dtype=weight_dtype)
+            ).latent_dist.sample()  # init image
+            latents = latents * vae.config.scaling_factor
+
+            # Convert masked images to latent space
+            masked_latents = vae.encode(
+                masked_image.reshape(image.shape).to(dtype=weight_dtype)  # masked image
+            ).latent_dist.sample()
+            masked_latents = masked_latents * vae.config.scaling_factor
+
+            # Convert ref images to latent space
+            ref_latents = vae.encode(
+                ref_image.reshape(image.shape).to(dtype=weight_dtype)  # ref image
+            ).latent_dist.sample()
+            ref_latents = ref_latents * vae.config.scaling_factor
+
+            mask = torch.nn.functional.interpolate(mask, size=masked_latents.shape[-2])
+
+            bsz = latents.shape[0]
+            timesteps = torch.tensor(
+                [
+                    0,
+                ]
+                * bsz,
+                device=latents.device,
+            )
+
+            if unet_config["in_channels"] == 9:
+                latent_model_input = torch.cat(
+                    [mask.to(dtype=masked_latents.dtype), masked_latents, ref_latents],
+                    dim=1,
+                )
+            else:
+                latent_model_input = torch.cat([masked_latents, ref_latents], dim=1)
+
+            audio_feature = audio_feature.to(dtype=weight_dtype)
+            # XXX Missing
+            audio_feature = pe(audio_feature)
+
+            # print(f"masks.dtype: {masks.dtype}")
+            # print(f"masked_latents.dtype: {masked_latents.dtype}")
+            # print(f"ref_latents.dtype: {ref_latents.dtype}")
+            # print(f"latent_model_input.dtype: {latent_model_input.dtype}")
+            # print(f"timesteps.dtype: {timesteps.dtype}")
+            # print(f"audio_feature.dtype: {audio_feature.dtype}")
+
+            image_pred = unet_copy(
+                latent_model_input, timesteps, encoder_hidden_states=audio_feature
+            ).sample
+
+            image = Image.new("RGB", (image_size * 4, image_size))
+            image.paste(decode_latents(vae_fp32, masked_latents), (0, 0))
+            image.paste(decode_latents(vae_fp32, ref_latents), (image_size, 0))
+            image.paste(decode_latents(vae_fp32, latents), (image_size * 2, 0))
+            image.paste(decode_latents(vae_fp32, image_pred), (image_size * 3, 0))
+
+            val_img_dir = f"{output_dir}/images/{global_step}"
+            if not os.path.exists(val_img_dir):
+                os.makedirs(val_img_dir)
+            image.save(
+                # "{0}/val_epoch_{1}_{2}_image.png".format(val_img_dir, global_step, step)
+                os.path.join(
+                    val_img_dir,
+                    f"validation-global_step={global_step:09d}-{step:04d}.jpg",
+                )
+            )
+
+            print(
+                "validation for step: {0}, time: {1:.1f} s".format(
+                    step, time.time() - start
+                )
+            )
+
+        print(
+            "validation done for epoch: {0}, time: {1:.1f} s".format(
+                epoch, time.time() - start
+            )
+        )
 
 
 def adapt_state_dict(src_state_dict, tgt_state_dict):
@@ -60,7 +214,7 @@ def parse_args():
     parser.add_argument(
         "--unet_config_file",
         type=str,
-        default="./musetalk.json",
+        default="./musetalk-gx_mod.json",
         # default="./models/musetalk/musetalk.json",
         # required=True,
         help="the configuration of unet file.",
@@ -69,7 +223,7 @@ def parse_args():
         "--reconstruction",
         default=True,
         action="store_true",
-        help="Flag to add prior preservation loss.",
+        help="Flag to add image-space reconstruction loss.",
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
@@ -115,12 +269,13 @@ def parse_args():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=1,
+        default=8,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
     )
     parser.add_argument(
         "--gradient_checkpointing",
         action="store_true",
+        default=True,
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.",
     )
     parser.add_argument(
@@ -333,9 +488,13 @@ def main():
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae"
     )
+    del vae.decoder
+    vae.decoder = None
     vae_fp32 = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="vae"
     )
+    del vae_fp32.encoder
+    vae_fp32.encoder = None
 
     print("Loading UNet2DConditionModel")
     # Load models and create wrapper for stable diffusion
@@ -435,13 +594,13 @@ def main():
 
     weight_dtype = torch.float32
     vae_fp32.to(accelerator.device, dtype=weight_dtype)
-    vae_fp32.encoder = None
+    # vae_fp32.encoder = None
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
     vae.to(accelerator.device, dtype=weight_dtype)
-    vae.decoder = None
+    # vae.decoder = None
     pe.to(accelerator.device, dtype=weight_dtype)
 
     num_update_steps_per_epoch = math.ceil(
@@ -525,14 +684,14 @@ def main():
             train_data_loader
         ):
             # Skip steps until we reach the resumed step
-            if (
-                args.resume_from_checkpoint
-                and epoch == first_epoch
-                and step < resume_step
-            ):
-                if step % args.gradient_accumulation_steps == 0:
-                    progress_bar.update(1)
-                continue
+            # if (
+            #     args.resume_from_checkpoint
+            #     and epoch == first_epoch
+            #     and step < resume_step
+            # ):
+            #     if step % args.gradient_accumulation_steps == 0:
+            #         progress_bar.update(1)
+            #     continue
 
             dataloader_time = time.time() - start
             start = time.time()
@@ -586,7 +745,7 @@ def main():
 
                 bsz = latents.shape[0]
                 # fix timestep for each image
-                timesteps = torch.tensor([0], device=latents.device)
+                timesteps = torch.tensor([0] * bsz, device=latents.device)
                 # concatenate the latents with the mask and the masked latents
                 # """
                 # print("=============vae latents=====".format(epoch, step))
@@ -631,9 +790,11 @@ def main():
                     # )  # the loss of the decoded images
 
                     loss_lip = F.l1_loss(
-                        image_pred_img[(inverse_mask > 0.5).expand_as(image_pred_img)].float(),
+                        image_pred_img[
+                            (inverse_mask > 0.5).expand_as(image_pred_img)
+                        ].float(),
                         image[(inverse_mask > 0.5).expand_as(image)].float(),
-                        reduction="mean"
+                        reduction="mean",
                     )
 
                     loss = loss + 2.0 * loss_lip  # add some weight to balance the loss
