@@ -6,15 +6,22 @@ import faiss
 class KNearestNeighbor:
 
     def __init__(self, d: int):
-        index = faiss.IndexFlatL2(d)
-        self.index = index
+        self.d = d
+        self._fitted = False
 
     def fit(self, X: np.ndarray):
+        self.index = faiss.IndexFlatL2(self.d)
         self.index.add(X)
+        self._fitted = True 
         return self
 
-    def predict(self, q: np.ndarray, k:int=1):
+    def predict(self, q: np.ndarray, k: int=1, return_distances: bool=False):
+        if not self._fitted:
+            raise Exception("Not fitted.")
+        # distances, nearest neighbor indices
         D, I = self.index.search(q, k)
+        if return_distances:
+            return I.tolist(), D.tolist()
         return I.tolist()
 
 

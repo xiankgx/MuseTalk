@@ -56,6 +56,8 @@ def get_video_fps(video_path):
 
 
 def datagen(whisper_chunks, vae_encode_latents, batch_size=8, delay_frame=0):
+    # XXX GX Due to possibility of invalid face bounding box, len(vae_encode_latents) could be less than len(whisper_chunks)
+
     whisper_batch, latent_batch = [], []
 
     for i, w in enumerate(whisper_chunks):
