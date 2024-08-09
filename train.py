@@ -4,6 +4,9 @@ Changes:
 1. Changed audio features from shape: b, 50, 384 to shape: b, 10, 1920. Reason being the original code uses 10 audio frames where each frame consists of a stack of 5 output layers from whisper encoder. To me, 5 output layers don't correspond to the sequence.
 2. Changed masking of frames from BEFORE image normalization (black masked area) to AFTER image normalization (gray masked area).
 3. Chaged Unet input channels from 8 to 9.
+
+20240807
+- Use only 2 audio frames (#5 and #6) as conditioning
 """
 
 import argparse
@@ -229,6 +232,7 @@ def parse_args():
         "--pretrained_model_name_or_path",
         type=str,
         default="./models/sd-vae-ft-mse/",
+        # default="madebyollin/sdxl-vae-fp16-fix",  # XXX
         # required=True,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
@@ -485,14 +489,24 @@ def main():
             ).repo_id
 
     print("Loading AutoencoderKL")
-    vae = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae"
-    )
+    try:
+        vae = AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="vae"
+        )
+    except Exception as e:
+        vae = AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path
+        )
     del vae.decoder
     vae.decoder = None
-    vae_fp32 = AutoencoderKL.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="vae"
-    )
+    try:
+        vae_fp32 = AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="vae"
+        )
+    except Exception as e:
+        vae_fp32 = AutoencoderKL.from_pretrained(
+            args.pretrained_model_name_or_path
+        )
     del vae_fp32.encoder
     vae_fp32.encoder = None
 

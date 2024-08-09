@@ -1,11 +1,12 @@
 import pickle
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import torch
 from face_detection import FaceAlignment, LandmarksType
+from scipy.spatial import ConvexHull
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
@@ -144,6 +145,7 @@ def get_landmark_and_bbox(img_list, upperbondrange: int = 0, batch_size_fa: int 
             if f is None:  # no face in the image
                 coords_list += [coord_placeholder]
                 coords_list_mouth.append(mouth_land_mark)
+                landmarks.append(face_land_mark)
                 continue
 
             half_face_coord = face_land_mark[
@@ -178,6 +180,7 @@ def get_landmark_and_bbox(img_list, upperbondrange: int = 0, batch_size_fa: int 
                 coords_list += [f_landmark]
 
             coords_list_mouth.append(mouth_land_mark)
+            landmarks.append(face_land_mark)
 
     print(
         "********************************************bbox_shift parameter adjustment**********************************************************"
@@ -188,7 +191,7 @@ def get_landmark_and_bbox(img_list, upperbondrange: int = 0, batch_size_fa: int 
     print(
         "*************************************************************************************************************************************"
     )
-    return coords_list, img_list, coords_list_mouth
+    return coords_list, img_list, landmarks
     # return coords_list,frames,coords_list_mouth
 
 
@@ -205,10 +208,28 @@ class ImageDataset(Dataset):
     def __getitem__(self, idx):
         image_path = self.image_paths[idx]
         image = self.read_img(image_path)
+        if self.transform:
+            image = self.transform(image)
         return image
 
 
+def detect_facial_landmarks(images: Union[np.ndarray, List[np.ndarray]]) -> np.ndarray:
+    results = [merge_data_samples(inference_topdown(model, image)) for image in images]
+    keypoints = [result.pred_instances.keypoints[0][23:91] for result in results]   # 23:91 for the 68 face landmarks
+    keypoints = np.stack(keypoints, axis=0).astype(np.int32)  # b, 68, 2
+    assert len(keypoints) == len(images)
+    return keypoints
+
+
+def detect_face(images: Union[np.ndarray, List[np.ndarray]]):
+    bboxes = fa.get_detections_for_batch(images)
+    assert len(bboxes) == len(images)
+    return bboxes
+
+
 def get_landmark_and_bbox_gx(img_list: List[str], batch_size: int=4, num_workers: int=4):
+    """My implementation using torch Dataset and DataLoader."""
+    
     def collate_fn(samples):
         """Custom collate function to just stack the images instead of converting them to torch tensors."""
         return np.stack(samples, axis=0)
@@ -222,14 +243,11 @@ def get_landmark_and_bbox_gx(img_list: List[str], batch_size: int=4, num_workers
     for batch in tqdm(dl, desc="Face landmarks and bounding box detection"):
         images = batch
 
-        results = [merge_data_samples(inference_topdown(model, image)) for image in images]
-        keypoints = [result.pred_instances.keypoints[0][23:91] for result in results]   # 23:91 for the 68 face landmarks
-        keypoints = np.stack(keypoints, axis=0).astype(np.int32)  # b, 68, 2
-
-        bbox = fa.get_detections_for_batch(images)
+        keypoints = detect_facial_landmarks(images)
+        bboxes = detect_face(images)
 
         keypoints_list.append(keypoints)
-        bbox_list += bbox
+        bbox_list += bboxes
 
     keypoints = np.concatenate(keypoints_list, axis=0)
     # Can't concat bbox_list because it may contain None 
@@ -240,14 +258,15 @@ def get_landmark_and_bbox_gx(img_list: List[str], batch_size: int=4, num_workers
     return keypoints, bbox_list
 
 
-def extract_mouth_landmarks_from_facial_landmarks(facial_landmarks: np.ndarray) -> np.ndarray:
+def extract_mouth_landmarks(facial_landmarks: np.ndarray) -> np.ndarray:
     # last 19 landmarks in the face landmarks (49-68, 1-indexed)
     # b, 68, 2 -> b, 19, 2
     return facial_landmarks[:, -19:]
 
 
 def extract_lower_face_landmarks(facial_landmarks: np.ndarray) -> np.ndarray:
-    return facial_landmarks[:, list(range(32-1, 36+1-1)) + list(range(3-1, 15-1)) + list(range(32-1, 36-1))]
+    # https://www.researchgate.net/profile/Fabrizio-Falchi/publication/338048224/figure/fig1/AS:837860722741255@1576772971540/68-facial-landmarks.jpg
+    return facial_landmarks[:, list(range(32 - 1, 36 + 1 - 1)) + list(range(4 - 1, 14 + 1 -1)) + list(range(32 - 1, 36 + 1 - 1))]
 
 
 def musetalk_get_bbox_from_face_landmarks_and_bbox(keypoints: np.ndarray, bbox_list: List[Optional[Tuple[int]]], y_offset: int=0):
@@ -291,6 +310,50 @@ def musetalk_get_bbox_from_face_landmarks_and_bbox(keypoints: np.ndarray, bbox_l
     assert len(coords_list) == len(keypoints)
     return coords_list
 
+
+def create_mask_from_2dlmk(
+    image: np.ndarray,
+    lmk: np.ndarray,
+    # bbox: list,
+    # dilate_scale: int,
+    # dilate_kernel: int,
+):
+    """Create mask by sorting the outer points of landmark using Convex Hull"""
+
+    lmk = np.round(lmk).astype(np.uint64)
+    hull = ConvexHull(lmk)
+    start_idx, next_idx = hull.simplices[0]
+    excepted_list = [
+        0,
+    ]
+    idx_list = [
+        start_idx,
+        next_idx,
+    ]
+
+    for _ in range(len(hull.simplices)):
+        for simplex_idx, simplex in enumerate(hull.simplices):
+            if next_idx in simplex and simplex_idx not in excepted_list:
+                next_idx = simplex[1] if next_idx == simplex[0] else simplex[0]
+                idx_list.append(next_idx)
+                excepted_list.append(simplex_idx)
+
+    new_lmk = []
+    for idx in idx_list:
+        new_lmk.append(list(lmk[idx]))
+    new_lmk = np.array(new_lmk).astype(np.uint64)
+    mask = np.zeros_like(image)
+    cv2.fillPoly(mask, pts=[new_lmk], color=(255, 255, 255))
+    # mask = mask[bbox[1] : bbox[3], bbox[0] : bbox[2], :3]
+    # mask = mask_erode_dilate(
+    #     Image.fromarray(mask), dilate_scale=dilate_scale, kernel_size_px=dilate_kernel
+    # )
+
+    # kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # dilated_mask = cv2.dilate(mask, kernel, iterations=5)
+
+    # return dilated_mask
+    return mask
 
 
 if __name__ == "__main__":

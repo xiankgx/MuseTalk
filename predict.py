@@ -11,64 +11,87 @@ import numpy as np
 import torch
 from cog import BasePredictor, Input, Path
 from gfpgan.utils import GFPGANer
-from scipy.spatial import ConvexHull
+
 from tqdm.auto import tqdm
 
 from knn import KNearestNeighbor
 from musetalk.utils.blending import get_image
 from musetalk.utils.preprocessing import (
     coord_placeholder,
+    create_mask_from_2dlmk,
     extract_lower_face_landmarks,
-    extract_mouth_landmarks_from_facial_landmarks,
+    extract_mouth_landmarks,
     get_landmark_and_bbox,
     get_landmark_and_bbox_gx,
     musetalk_get_bbox_from_face_landmarks_and_bbox,
+    detect_facial_landmarks
 )
 from musetalk.utils.utils import datagen, get_file_type, get_video_fps, load_all_model
 
 
-def create_mask_from_2dlmk(
-    image: np.ndarray,
-    lmk: np.ndarray,
-    # bbox: list,
-    # dilate_scale: int,
-    # dilate_kernel: int,
-):
-    """Create mask by sorting the outer points of landmark using Convex Hull"""
+def make_divisible(
+    img: np.ndarray, divisor: int = 2 ** 5, interpolation=cv2.INTER_CUBIC
+) -> np.ndarray:
+    """Resize an image (array) such that its sides are divisible by the divisor."""
+    h, w = img.shape[:2]
+    target_h = int(np.round(h / divisor)) * divisor
+    target_w = int(np.round(w / divisor)) * divisor
+    # print(f"h: {h}, w: {w}")
+    # print(f"target_h: {target_h}, target_w: {target_w}")
+    if target_h != h or target_w != w:
+        img = cv2.resize(img, (target_w, target_h), interpolation=interpolation)
+    return img
 
-    lmk = np.round(lmk).astype(np.uint64)
-    hull = ConvexHull(lmk)
-    start_idx, next_idx = hull.simplices[0]
-    excepted_list = [
-        0,
-    ]
-    idx_list = [
-        start_idx,
-        next_idx,
-    ]
 
-    for _ in range(len(hull.simplices)):
-        for simplex_idx, simplex in enumerate(hull.simplices):
-            if next_idx in simplex and simplex_idx not in excepted_list:
-                next_idx = simplex[1] if next_idx == simplex[0] else simplex[0]
-                idx_list.append(next_idx)
-                excepted_list.append(simplex_idx)
+def Laplacian_Pyramid_Blending_with_mask(A, B, m, num_levels: int=6):
+    """
+    A and B values in range [0, 255] or [0, 1.0].
+    mask values in range [0.0, 1.0]. 1.0 means take pixel value from A.
+    """
 
-    new_lmk = []
-    for idx in idx_list:
-        new_lmk.append(list(lmk[idx]))
-    new_lmk = np.array(new_lmk).astype(np.uint64)
-    mask = np.zeros_like(image)
-    cv2.fillPoly(mask, pts=[new_lmk], color=(255, 255, 255))
-    # mask = mask[bbox[1] : bbox[3], bbox[0] : bbox[2], :3]
-    # mask = mask_erode_dilate(
-    #     Image.fromarray(mask), dilate_scale=dilate_scale, kernel_size_px=dilate_kernel
-    # )
+    # generate Gaussian pyramid for A,B and mask
+    GA = A.copy()
+    GB = B.copy()
+    GM = m.copy()
+    gpA = [GA]
+    gpB = [GB]
+    gpM = [GM]
+    for i in range(num_levels):
+        GA = cv2.pyrDown(GA)
+        GB = cv2.pyrDown(GB)
+        GM = cv2.pyrDown(GM)
+        gpA.append(np.float32(GA))
+        gpB.append(np.float32(GB))
+        gpM.append(np.float32(GM))
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    dilated_mask = cv2.dilate(mask, kernel, iterations=5)
+    # generate Laplacian Pyramids for A,B and masks
+    lpA = [
+        gpA[num_levels - 1]
+    ]  # the bottom of the Lap-pyr holds the last (smallest) Gauss level
+    lpB = [gpB[num_levels - 1]]
+    gpMr = [gpM[num_levels - 1]]
+    for i in range(num_levels - 1, 0, -1):
+        # Laplacian: subtract upscaled version of lower level from current level
+        # to get the high frequencies
+        LA = np.subtract(gpA[i - 1], cv2.pyrUp(gpA[i]))
+        LB = np.subtract(gpB[i - 1], cv2.pyrUp(gpB[i]))
+        lpA.append(LA)
+        lpB.append(LB)
+        gpMr.append(gpM[i - 1])  # also reverse the masks
 
-    return dilated_mask
+    # Now blend images according to mask in each level
+    LS = []
+    for la, lb, gm in zip(lpA, lpB, gpMr):
+        gm = gm[:, :, np.newaxis]
+        ls = la * gm + lb * (1.0 - gm)
+        LS.append(ls)
+
+    # now reconstruct
+    ls_ = LS[0]
+    for i in range(1, num_levels):
+        ls_ = cv2.pyrUp(ls_)
+        ls_ = cv2.add(ls_, LS[i])
+    return ls_
 
 
 def extract_video_frames(
@@ -217,6 +240,7 @@ class Predictor(BasePredictor):
 
         frames_dir = os.path.join(result_dir, "frames")
         cropped_frames_dir = os.path.join(result_dir, "cropped_frames")
+        masked_frames_dir = os.path.join(result_dir, "masked_frames")
         output_frames_dir = os.path.join(result_dir, "output_frames")
         output_vid_name = os.path.join(result_dir, "output.mp4")
 
@@ -392,7 +416,12 @@ class Predictor(BasePredictor):
 
         #######################################################################
         # Encode cropped face images to latents
+        #
+        # TODO:
+        # 1. Use the lower face mask instead of lower frame mask. Also take note to erode/dilate the lower face mask so ask to give the model more hints to maintain details like facial hair.
         #######################################################################
+
+        os.makedirs(masked_frames_dir, exist_ok=True)
 
         if input_type == "image":
             coord_list = coord_list * len(whisper_chunks)
@@ -434,15 +463,25 @@ class Predictor(BasePredictor):
 
             # print(f"crop_mouth_mask - shape: {crop_mouth_mask.shape}, dtype: {crop_mouth_mask.dtype}, min: {crop_mouth_mask.min()}, max: {crop_mouth_mask.max()}")
             # XXX
-            # crop_mouth_mask = np.zeros_like(crop_mouth_mask)
-            # crop_mouth_mask = np.zeros(IMAGE_SIZE, dtype=np.uint8)
-            # crop_mouth_mask[144:, :] = 255  # XXX
-            # crop_mouth_mask[128:,:16] = 0
-            # crop_mouth_mask[128:,-16:] = 0
-            # crop_mouth_mask[128+32:-32,32:-32] = 255
+            # lower_face_mask = np.zeros_like(crop_mouth_mask)
+            # lower_face_mask = np.zeros(IMAGE_SIZE, dtype=np.uint8)
+            # lower_face_mask[144:, :] = 255  # XXX
+            # lower_face_mask[128:,:16] = 0
+            # lower_face_mask[128:,-16:] = 0
+            # lower_face_mask[128+32:-32,32:-32] = 255
 
             inpaint_mask = lower_face_mask
             valid_mask = 255 - inpaint_mask
+
+            # Dilate the valid mask, shrink the lower face mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            valid_mask = cv2.dilate(valid_mask, kernel, iterations=3)
+
+            alpha = valid_mask/np.float32(255)
+            if alpha.ndim == 2:
+                alpha = alpha[..., None]
+            masked_face = (crop_frame * alpha).astype(np.uint8)
+            cv2.imwrite(os.path.join(masked_frames_dir, f"{i:08d}.jpg"), masked_face)
 
             ref_crop_frame = (
                 None  # None meaning use the current frame as the reference frame
@@ -515,7 +554,11 @@ class Predictor(BasePredictor):
                 audio_feature_batch = audio_feature_batch.reshape(
                     audio_feature_batch.size(0), -1, 5 * 384
                 )
-            # print(f"audio_feature_batch.shape: {audio_feature_batch.shape}")
+
+            # XXX
+            audio_feature_batch = audio_feature_batch[:, [4, 5],:]
+
+            print(f"audio_feature_batch.shape: {audio_feature_batch.shape}")
 
             audio_feature_batch = pe(audio_feature_batch)
 
@@ -532,6 +575,9 @@ class Predictor(BasePredictor):
 
         #######################################################################
         # Paste inpainted image back to the original video
+        #
+        # TODO
+        # 1. Extract only the mouth and paste it onto the original face.
         #######################################################################
 
         # print("Pasting inpainted image back to the original video...")
@@ -573,7 +619,7 @@ class Predictor(BasePredictor):
                     has_aligned=False,
                     only_center_face=True,
                     paste_back=True,
-                    weight=1.0,
+                    weight=0.5,
                 )
 
             combined_frame = get_image(ori_frame, res_frame, bbox)
@@ -589,10 +635,36 @@ class Predictor(BasePredictor):
                     has_aligned=False,
                     only_center_face=False,
                     paste_back=True,
-                    weight=1.0,
+                    weight=0.5,
                 )
 
-            cv2.imwrite(f"{output_frames_dir}/{str(i).zfill(8)}.png", combined_frame)
+            facial_landmarks = detect_facial_landmarks([combined_frame, ])
+            mouth_landmarks = extract_mouth_landmarks(facial_landmarks)
+            mouth_landmarks = mouth_landmarks[0]
+            mouth_mask = create_mask_from_2dlmk(combined_frame, mouth_landmarks)
+            if mouth_mask.ndim == 3:
+                mouth_mask = mouth_mask[..., 0]
+
+            # Dilate the valid mask, shrink the lower face mask
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mouth_mask = cv2.dilate(mouth_mask, kernel=kernel, iterations=15)
+
+            # Take the mouth from the generated face image, other areas from the original face image and perform Gaussian Pyramid Blending
+            pyramid_levels = 5
+            ori_frame_div = make_divisible(ori_frame[y1:y2, x1:x2], divisor=2 ** pyramid_levels)  # [0, 255]
+            combined_frame_div = make_divisible(combined_frame[y1:y2, x1:x2], divisor=2 ** pyramid_levels)  # [0, 255]
+            mouth_mask_div = make_divisible(mouth_mask[y1:y2, x1:x2], divisor=2 ** pyramid_levels)
+            mouth_mask_div = mouth_mask_div/np.float32(255)  # [0, 1]
+            # print(f"ori_frame_div.shape: {ori_frame_div.shape}, dtype: {ori_frame_div.dtype}")
+            # print(f"combined_frame_div.shape: {combined_frame_div.shape}, dtype: {combined_frame_div.dtype}")
+            # print(f"mouth_mask_div.shape: {mouth_mask_div.shape}, dtype: {mouth_mask_div.dtype}")
+            res_frame2 = Laplacian_Pyramid_Blending_with_mask(ori_frame_div, combined_frame_div, 1.0 - mouth_mask_div, num_levels=pyramid_levels)
+            res_frame2 = res_frame2.astype(np.uint8)
+            res_frame2 = cv2.resize(res_frame2, (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
+
+            combined_frame2 = get_image(ori_frame, res_frame2, bbox)
+
+            cv2.imwrite(f"{output_frames_dir}/{str(i).zfill(8)}.png", combined_frame2)
 
         # print("Done!")
 
@@ -621,10 +693,21 @@ if __name__ == "__main__":
     #     audio="warren-bad.mp4",
     #     face_enhance_strategy="full_frame",
     # )
-    predictor.predict(
-        video="VID-20240517-WA0007.mp4",
-        audio="elon.wav",
-        face_enhance_strategy="full_frame",
-    )
+    # predictor.predict(
+    #     video="VID-20240517-WA0007.mp4",
+    #     audio="elon.wav",
+    #     face_enhance_strategy="full_frame",
+    # )
+    # predictor.predict(
+    #     video="VID-20240517-WA0007.mp4",
+    #     audio="1.wav",
+    #     face_enhance_strategy="full_frame",
+    # )
+    # predictor.predict(
+    #     video="VID-20240517-WA0007.mp4",
+    #     audio="2.wav",
+    #     face_enhance_strategy="full_frame",
+    # )    
     # predictor.predict(video="1.mp4", audio="1.wav", face_enhance_strategy="full_frame")
-    # predictor.predict(video="1.mp4", audio="2.wav", face_enhance_strategy="no")
+    # predictor.predict(video="1.mp4", audio="2.wav", face_enhance_strategy="full_frame")
+    predictor.predict(video="1.mp4", audio="elon.wav", face_enhance_strategy="full_frame")

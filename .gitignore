@@ -10,3 +10,8 @@ data/audio/*.wav
 data/video/*.mp4
 *.wav
 *.mp4
+*.mp3
+*.jpg
+*.png
+HDTF/
+HDTF_train_processed

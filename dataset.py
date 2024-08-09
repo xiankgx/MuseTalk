@@ -3,10 +3,13 @@ import os
 import pickle
 import time
 
+import cv2
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+
+from musetalk.utils.preprocessing import create_mask_from_2dlmk, extract_mouth_landmarks, extract_lower_face_landmarks
 
 IMAGE_SIZE = (256, 256)
 IMAGE_MEAN = (0.5, 0.5, 0.5)
@@ -69,6 +72,19 @@ def mouth_mask_for_image(image: Image.Image, mouth_bbox, crop_bbox):
     return Image.fromarray(mask_np[y1:y2, x1:x2])
 
 
+def random_mask_erotion_dilation(mask: Image.Image, kernel_size=(5, 5), iterations: int=7) -> Image.Image:
+    if iterations == 0:
+        return mask
+
+    mask_np = np.array(mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, kernel_size)
+    # if np.random.rand() < 0.33:
+    #     dilated_mask = cv2.erode(mask_np, kernel, iterations=iterations)
+    # else:
+    dilated_mask = cv2.dilate(mask_np, kernel, iterations=iterations)
+    return Image.fromarray(dilated_mask)
+
+
 IMAGE_TRANSFORM = transforms.Compose(
     [
         transforms.Resize(IMAGE_SIZE),
@@ -122,10 +138,18 @@ class HDTFDataset(Dataset):
             coord_list = pickle.load(f)
             # print(f"coord_list time: {time.time() - tic}")
 
-        mouth_landmarks_list_path = os.path.join(video_dir, "mouth_landmarks_list.pkl")
-        with open(mouth_landmarks_list_path, "rb") as f:
-            mouth_landmarks_list = pickle.load(f)
-        assert len(mouth_landmarks_list) == len(coord_list)
+        # mouth_landmarks_list_path = os.path.join(video_dir, "mouth_landmarks_list.pkl")
+        # with open(mouth_landmarks_list_path, "rb") as f:
+        #     mouth_landmarks_list = pickle.load(f)
+        # assert len(mouth_landmarks_list) == len(coord_list)
+        # # print(f"mouth_landmarks_list: {mouth_landmarks_list}")
+
+        facial_landmarks_path = os.path.join(video_dir, "facial_landmarks.pkl")
+        with open(facial_landmarks_path, "rb") as f:
+            facial_landmarks = pickle.load(f)
+            if isinstance(facial_landmarks, list):
+                facial_landmarks = np.stack(facial_landmarks, axis=0)
+        assert len(facial_landmarks) == len(coord_list)
         # print(f"mouth_landmarks_list: {mouth_landmarks_list}")
 
         num_frames = min(num_audio_features, len(coord_list))
@@ -172,10 +196,32 @@ class HDTFDataset(Dataset):
         #     mouth_bbox=get_mouth_bounding_box(mouth_landmarks_list[frame_num]),
         # )
 
-        if np.random.rand() <= 0.7:
-            mask = half_mask_for_image(frame)
-        else:
-            mask = random_mask_for_image(frame)
+
+        try:
+            # print(f"facial_landmarks.shape: {facial_landmarks.shape}")
+            lower_face_landmarks = extract_lower_face_landmarks(facial_landmarks)[frame_num]
+            # print(f"lower_face_landmarks.shape: {lower_face_landmarks.shape}")
+
+            mask = np.array(crop_image(create_mask_from_2dlmk(np.array(Image.open(frame_path)), lower_face_landmarks), (x1, y1, x2, y2)))
+            if mask.ndim == 3:
+                mask = mask[..., 0]
+            # Invert the mask
+            mask = Image.fromarray(255 - mask)
+            mask = random_mask_erotion_dilation(mask, iterations=np.random.randint(0, 9+1))
+
+            if np.random.rand() <= 0.7:
+                if np.random.rand() <= 0.7:
+                    mask = half_mask_for_image(frame)
+                else:
+                    mask = random_mask_for_image(frame)
+        except Exception as e:
+            print(f"Error obtaining lower face landmark: {str(e)}")
+            if np.random.rand() <= 0.7:
+                mask = half_mask_for_image(frame)
+            else:
+                mask = random_mask_for_image(frame)
+        
+        # mask = crop_image(create_mask_from_2dlmk(Image.open(frame_path), extract_lower_face_landmarks(facial_landmarks)), (x1, y1, x2, y2))
 
         # if np.random.rand() <= 0.9:
         #     if np.random.rand() <= 0.7:
@@ -215,7 +261,7 @@ class HDTFDataset(Dataset):
         #     # 10 audio frames, by 1 by 384 * 5 (diff output layers)
         #     "audio_feature": audio_feature.reshape(10, 384 * 5),
         # }
-        return ref_frame, frame, masked_frame, mask, audio_feature.reshape(-1, 5 * 384)
+        return ref_frame, frame, masked_frame, mask, audio_feature.reshape(-1, 5 * 384)[[4, 5]]  # XXX
         # return ref_frame, frame, masked_frame, mask, audio_feature
 
 
@@ -224,6 +270,7 @@ if __name__ == "__main__":
     from torch.utils.data import DataLoader
 
     frames_paths = glob.glob("HDTF_train_processed/**/frames/*.jpg", recursive=True)
+    # frames_paths = glob.glob("talking_face_others_train_processed/**/frames/*.jpg", recursive=True)
     print(f"# num frames: {len(frames_paths)}")
 
     ds = HDTFDataset(frames_paths)
