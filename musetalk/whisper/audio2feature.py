@@ -37,11 +37,12 @@ class Audio2Feature():
         # XXX GX HACK
         for idx in range(left_idx,right_idx):
         # for idx in [
-        #     # center_idx-2, center_idx-1, 
-        #     # center_idx-1, center_idx, 
-        #     # center_idx, center_idx+1, 
-        #     # center_idx+1, center_idx+2, 
-        #     # center_idx+2, center_idx+3
+        #     center_idx-2, center_idx-1, 
+        #     center_idx-1, center_idx, 
+        #     center_idx, center_idx+1, 
+        #     center_idx+1, center_idx+2, 
+        #     center_idx+2, center_idx+3
+        # ]:
 
         #     # jumpy
         #     # center_idx, center_idx, 

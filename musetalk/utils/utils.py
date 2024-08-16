@@ -59,21 +59,24 @@ def datagen(whisper_chunks, vae_encode_latents, batch_size=8, delay_frame=0):
     # XXX GX Due to possibility of invalid face bounding box, len(vae_encode_latents) could be less than len(whisper_chunks)
 
     whisper_batch, latent_batch = [], []
+    vae_latents_indices = []  # This is to keep track which vae latent are we working with
 
     for i, w in enumerate(whisper_chunks):
         idx = (i + delay_frame) % len(vae_encode_latents)
         latent = vae_encode_latents[idx]
         whisper_batch.append(w)
         latent_batch.append(latent)
+        vae_latents_indices.append(idx)
 
         if len(latent_batch) >= batch_size:
             whisper_batch = np.stack(whisper_batch)
             latent_batch = torch.cat(latent_batch, dim=0)
-            yield whisper_batch, latent_batch
+            yield whisper_batch, latent_batch, vae_latents_indices
             whisper_batch, latent_batch = [], []
+            vae_latents_indices = []
 
     # the last batch may smaller than batch size
     if len(latent_batch) > 0:
         whisper_batch = np.stack(whisper_batch)
         latent_batch = torch.cat(latent_batch, dim=0)
-        yield whisper_batch, latent_batch
+        yield whisper_batch, latent_batch, vae_latents_indices

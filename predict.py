@@ -151,7 +151,7 @@ class Predictor(BasePredictor):
                 whisper_checkpoint="./models/whisper/tiny.pt",
                 vae_model_id_or_path="./models/sd-vae-ft-mse/",
                 unet_config_path="./musetalk-gx_mod.json",
-                unet_checkpoint="./output/musetalk-finetune/checkpoint-464000/model.safetensors",
+                unet_checkpoint="./output/musetalk-finetune/checkpoint-468000/model.safetensors",
                 audio_features_dim=5 * 384,
             )
         else:
@@ -190,28 +190,33 @@ class Predictor(BasePredictor):
         )
         print("Done!")
 
-    # def predict(
-    #     self,
-    #     video: Path = Input(description="video path"),
-    #     audio: Path = Input(description="audio path"),
-    #     bbox_shift: int = Input(description="BBox_shift value, px", default=0),
-    #     cycle: bool = Input(
-    #         description="Cycle video to smooth the first and last frames.",
-    #         default=False,
-    #     ),
-    #     face_enhance: bool = Input(
-    #         description="Enhance face with GFPGAN.", default=False
-    #     ),
-    # ) -> Path:
     def predict(
         self,
-        video: str,
-        audio: str,
-        bbox_shift: int = 0,
-        cycle: bool = False,
-        face_enhance_strategy: str = "full_frame",  # no, cropped_face, full_frame, cropped_face+full_frame
-        use_nn_ref_frame: bool = False,
+        video: Path = Input(description="video path"),
+        audio: Path = Input(description="audio path"),
+        bbox_shift: int = Input(description="BBox_shift value, px", default=0),
+        cycle: bool = Input(
+            description="Cycle video to smooth the first and last frames.",
+            default=False,
+        ),
+        face_enhance_strategy: str = Input(
+            description="Enhance face with GFPGAN.", 
+            choices=["no", "cropped_face", "full_frame", "cropped_face+full_frame"], 
+            default="full_frame"
+        ),
+        use_nn_ref_frame: bool = Input(description="Use nearest neighbor reference face.", default=False),
+        keep_mouth_only: bool = Input(description="Replace the mouth only.", default=False)
     ) -> Path:
+    # def predict(
+    #     self,
+    #     video: str,
+    #     audio: str,
+    #     bbox_shift: int = 0,
+    #     cycle: bool = False,
+    #     face_enhance_strategy: str = "full_frame",  # no, cropped_face, full_frame, cropped_face+full_frame
+    #     use_nn_ref_frame: bool = False,
+    #     keep_mouth_only: bool = False
+    # ) -> Path:
         """Run a single prediction on the model"""
 
         print(f"video: {video}")
@@ -221,6 +226,7 @@ class Predictor(BasePredictor):
         # print(f"face_enhance: {face_enhance}")
         print(f"face_enhance_strategy: {face_enhance_strategy}")
         print(f"use_nn_ref_frame: {use_nn_ref_frame}")
+        print(f"keep_mouth_only: {keep_mouth_only}")
 
         video_path = str(video)
         audio_path = str(audio)
@@ -232,11 +238,11 @@ class Predictor(BasePredictor):
         timesteps = self.timesteps
         IMAGE_SIZE = (256, 256)
 
-        # result_dir = tempfile.mkdtemp()
-        result_dir = "debug"
-        if os.path.exists(result_dir):
-            shutil.rmtree(result_dir)
-        os.makedirs(result_dir, exist_ok=True)
+        result_dir = tempfile.mkdtemp()
+        # result_dir = "debug"
+        # if os.path.exists(result_dir):
+        #     shutil.rmtree(result_dir)
+        # os.makedirs(result_dir, exist_ok=True)
 
         frames_dir = os.path.join(result_dir, "frames")
         cropped_frames_dir = os.path.join(result_dir, "cropped_frames")
@@ -423,12 +429,13 @@ class Predictor(BasePredictor):
 
         os.makedirs(masked_frames_dir, exist_ok=True)
 
-        if input_type == "image":
-            coord_list = coord_list * len(whisper_chunks)
-            frame_list = frame_list * len(whisper_chunks)
-            lower_face_landmarks = lower_face_landmarks * len(whisper_chunks)
+        # if input_type == "image":
+        #     coord_list = coord_list * len(whisper_chunks)
+        #     frame_list = frame_list * len(whisper_chunks)
+        #     lower_face_landmarks = lower_face_landmarks * len(whisper_chunks)
 
         input_latent_list = []
+        latent_to_input_frame_indices = []
         prev_i = -1
         for i, (bbox, frame, _lower_face_landmarks, whisper_chunk) in enumerate(
             zip(coord_list, frame_list, lower_face_landmarks, whisper_chunks)
@@ -465,10 +472,13 @@ class Predictor(BasePredictor):
             # XXX
             # lower_face_mask = np.zeros_like(crop_mouth_mask)
             # lower_face_mask = np.zeros(IMAGE_SIZE, dtype=np.uint8)
-            # lower_face_mask[144:, :] = 255  # XXX
+            # lower_face_mask[_lower_face_landmarks.min(axis=0)[1] - y1:, :] = 255  # XXX
             # lower_face_mask[128:,:16] = 0
             # lower_face_mask[128:,-16:] = 0
             # lower_face_mask[128+32:-32,32:-32] = 255
+
+            print(f"_lower_face_landmarks.shape: {_lower_face_landmarks.shape}")
+            print(f"_lower_face_landmarks min: {_lower_face_landmarks.min(axis=0)}")
 
             inpaint_mask = lower_face_mask
             valid_mask = 255 - inpaint_mask
@@ -508,6 +518,7 @@ class Predictor(BasePredictor):
                     crop_frame, mask=valid_mask, ref_img=ref_crop_frame
                 )
             input_latent_list.append(latents)
+            latent_to_input_frame_indices.append(i)
 
         #######################################################################
         # Batched (latent inpainting) inference
@@ -519,12 +530,28 @@ class Predictor(BasePredictor):
         # GX
         print(f"len(frame_list): {len(frame_list)}")
         print(f"len(whisper_chunks): {len(whisper_chunks)}")
-        seq_len = min(len(frame_list), len(whisper_chunks))
+        # seq_len = min(len(frame_list), len(whisper_chunks))  # XXX
+        seq_len = len(whisper_chunks)
         print(f"seq_len: {seq_len}")
-        frame_list = frame_list[:seq_len]
-        coord_list = coord_list[:seq_len]
-        input_latent_list = input_latent_list[:seq_len]
-        whisper_chunks = whisper_chunks[:seq_len]
+
+        if len(input_latent_list)/seq_len < 1.0:
+            print("here!")
+            num_repeats = int(np.ceil(seq_len/len(input_latent_list)))
+            print(f"num_repeats: {num_repeats}")
+            # len_valid = len(input_latent_list)
+            # print(f"len(valid): {len_valid}")
+
+            initial_input_latent_list = input_latent_list.copy()
+            latent_to_input_frame_indices = latent_to_input_frame_indices.copy()
+
+            for i in range(num_repeats):
+                input_latent_list += initial_input_latent_list[::(-1 if i % 2 == 0 else 1)]
+                latent_to_input_frame_indices += latent_to_input_frame_indices[::(-1 if i % 2 == 0 else 1)]
+                
+        # frame_list = frame_list[:seq_len]
+        # coord_list = coord_list[:seq_len]
+        # input_latent_list = input_latent_list[:seq_len]
+        # whisper_chunks = whisper_chunks[:seq_len]
 
         # to smooth the first and the last frame
         if cycle:
@@ -539,7 +566,8 @@ class Predictor(BasePredictor):
         video_num = len(whisper_chunks)
         gen = datagen(whisper_chunks, input_latent_list_cycle, batch_size)
         res_frame_list = []
-        for i, (whisper_batch, latent_batch) in enumerate(
+        latent_indices = []
+        for i, (whisper_batch, latent_batch, latent_indices_batch) in enumerate(
             tqdm(
                 gen,
                 total=int(np.ceil(float(video_num) / batch_size)),
@@ -556,7 +584,7 @@ class Predictor(BasePredictor):
                 )
 
             # XXX
-            audio_feature_batch = audio_feature_batch[:, [4, 5],:]
+            # audio_feature_batch = audio_feature_batch[:, [4, 5],:]
 
             print(f"audio_feature_batch.shape: {audio_feature_batch.shape}")
 
@@ -570,6 +598,9 @@ class Predictor(BasePredictor):
             recon = vae.decode_latents(pred_latents)
             for res_frame in recon:
                 res_frame_list.append(res_frame)
+            latent_indices += latent_indices_batch
+
+        assert len(res_frame_list) == len(latent_indices)
 
         # print("Done!")
 
@@ -584,8 +615,8 @@ class Predictor(BasePredictor):
 
         os.makedirs(output_frames_dir, exist_ok=True)
 
-        for i, res_frame in enumerate(
-            tqdm(res_frame_list, desc="Pasting inpainted image back to original video")
+        for i, (res_frame, latent_index) in enumerate(
+            tqdm(zip(res_frame_list, latent_indices), desc="Pasting inpainted image back to original video", total=len(res_frame_list))
         ):
             # XXX GX len(coord_list_cycle) == len(frame_list_cycle) could be greater than len(res_frame_list)
             # How to handle this?
@@ -593,7 +624,8 @@ class Predictor(BasePredictor):
             # bbox = coord_list_cycle[i % (len(coord_list_cycle))]
             # ori_frame = cv2.imread(frame_list_cycle[i % (len(frame_list_cycle))])
 
-            ori_frame_index = i
+            # ori_frame_index = i
+            ori_frame_index = latent_to_input_frame_indices[latent_index]
 
             bbox = coord_list_cycle[ori_frame_index]
             ori_frame = cv2.imread(frame_list_cycle[ori_frame_index])
@@ -638,33 +670,36 @@ class Predictor(BasePredictor):
                     weight=0.5,
                 )
 
-            facial_landmarks = detect_facial_landmarks([combined_frame, ])
-            mouth_landmarks = extract_mouth_landmarks(facial_landmarks)
-            mouth_landmarks = mouth_landmarks[0]
-            mouth_mask = create_mask_from_2dlmk(combined_frame, mouth_landmarks)
-            if mouth_mask.ndim == 3:
-                mouth_mask = mouth_mask[..., 0]
+            # We will just take the generated mouth only
+            if keep_mouth_only:
+                print("KEEP GENERATED MOUTH ONLY...")
 
-            # Dilate the valid mask, shrink the lower face mask
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            mouth_mask = cv2.dilate(mouth_mask, kernel=kernel, iterations=15)
+                # Detect the facial landmark of the "generated" "full" frame
+                facial_landmarks = detect_facial_landmarks([combined_frame, ])
+                mouth_landmarks = extract_mouth_landmarks(facial_landmarks)
+                mouth_landmarks = mouth_landmarks[0]
+                mouth_mask = create_mask_from_2dlmk(combined_frame, mouth_landmarks)
+                if mouth_mask.ndim == 3:
+                    mouth_mask = mouth_mask[..., 0]
 
-            # Take the mouth from the generated face image, other areas from the original face image and perform Gaussian Pyramid Blending
-            pyramid_levels = 5
-            ori_frame_div = make_divisible(ori_frame[y1:y2, x1:x2], divisor=2 ** pyramid_levels)  # [0, 255]
-            combined_frame_div = make_divisible(combined_frame[y1:y2, x1:x2], divisor=2 ** pyramid_levels)  # [0, 255]
-            mouth_mask_div = make_divisible(mouth_mask[y1:y2, x1:x2], divisor=2 ** pyramid_levels)
-            mouth_mask_div = mouth_mask_div/np.float32(255)  # [0, 1]
-            # print(f"ori_frame_div.shape: {ori_frame_div.shape}, dtype: {ori_frame_div.dtype}")
-            # print(f"combined_frame_div.shape: {combined_frame_div.shape}, dtype: {combined_frame_div.dtype}")
-            # print(f"mouth_mask_div.shape: {mouth_mask_div.shape}, dtype: {mouth_mask_div.dtype}")
-            res_frame2 = Laplacian_Pyramid_Blending_with_mask(ori_frame_div, combined_frame_div, 1.0 - mouth_mask_div, num_levels=pyramid_levels)
-            res_frame2 = res_frame2.astype(np.uint8)
-            res_frame2 = cv2.resize(res_frame2, (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
+                # Enlarge the mouth mask
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                mouth_mask = cv2.dilate(mouth_mask, kernel=kernel, iterations=15)
 
-            combined_frame2 = get_image(ori_frame, res_frame2, bbox)
+                # Take the mouth from the generated face image, other areas from the original face image and perform Gaussian Pyramid Blending
+                pyramid_levels = 5
+                divisor = 2 ** pyramid_levels
+                ori_frame_div = make_divisible(ori_frame[y1:y2, x1:x2], divisor=divisor)  # [0, 255]
+                combined_frame_div = make_divisible(combined_frame[y1:y2, x1:x2], divisor=divisor)  # [0, 255]
+                mouth_mask_div = make_divisible(mouth_mask[y1:y2, x1:x2], divisor=divisor)
+                mouth_mask_div = mouth_mask_div/np.float32(255)  # [0, 1]
+                res_frame2 = Laplacian_Pyramid_Blending_with_mask(ori_frame_div, combined_frame_div, 1.0 - mouth_mask_div, num_levels=pyramid_levels)
+                res_frame2 = res_frame2.astype(np.uint8)
+                res_frame2 = cv2.resize(res_frame2, (x2 - x1, y2 - y1), interpolation=cv2.INTER_CUBIC)
 
-            cv2.imwrite(f"{output_frames_dir}/{str(i).zfill(8)}.png", combined_frame2)
+                combined_frame = get_image(ori_frame, res_frame2, bbox)
+
+            cv2.imwrite(f"{output_frames_dir}/{str(i).zfill(8)}.png", combined_frame)
 
         # print("Done!")
 
@@ -692,22 +727,27 @@ if __name__ == "__main__":
     #     video="VID-20240517-WA0007.mp4",
     #     audio="warren-bad.mp4",
     #     face_enhance_strategy="full_frame",
+    #     keep_mouth_only=False,
     # )
     # predictor.predict(
     #     video="VID-20240517-WA0007.mp4",
     #     audio="elon.wav",
     #     face_enhance_strategy="full_frame",
+    #     keep_mouth_only=False
     # )
     # predictor.predict(
     #     video="VID-20240517-WA0007.mp4",
     #     audio="1.wav",
     #     face_enhance_strategy="full_frame",
+    #     keep_mouth_only=False
     # )
     # predictor.predict(
     #     video="VID-20240517-WA0007.mp4",
     #     audio="2.wav",
     #     face_enhance_strategy="full_frame",
+    #     keep_mouth_only=False
     # )    
-    # predictor.predict(video="1.mp4", audio="1.wav", face_enhance_strategy="full_frame")
-    # predictor.predict(video="1.mp4", audio="2.wav", face_enhance_strategy="full_frame")
-    predictor.predict(video="1.mp4", audio="elon.wav", face_enhance_strategy="full_frame")
+    # predictor.predict(video="1.mp4", audio="1.wav", face_enhance_strategy="full_frame", keep_mouth_only=False)
+    # predictor.predict(video="1.mp4", audio="2.wav", face_enhance_strategy="full_frame", keep_mouth_only=False)
+    # predictor.predict(video="1.mp4", audio="elon.wav", face_enhance_strategy="full_frame", keep_mouth_only=False)
+    predictor.predict(video="assets/demo/sun1/sun.png", audio="1.wav", face_enhance_strategy="full_frame", keep_mouth_only=False)

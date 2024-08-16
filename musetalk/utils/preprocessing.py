@@ -227,7 +227,7 @@ def detect_face(images: Union[np.ndarray, List[np.ndarray]]):
     return bboxes
 
 
-def get_landmark_and_bbox_gx(img_list: List[str], batch_size: int=4, num_workers: int=4):
+def get_landmark_and_bbox_gx(img_list: List[str], batch_size: int=4, num_workers: int=0):
     """My implementation using torch Dataset and DataLoader."""
     
     def collate_fn(samples):
